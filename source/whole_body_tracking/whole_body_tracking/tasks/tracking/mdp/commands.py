@@ -356,7 +356,7 @@ class MotionCommandCfg(CommandTermCfg):
 
     asset_name: str = MISSING
 
-    motion_file: str = MISSING
+    motion_file: str = ""
     anchor_body_name: str = MISSING
     body_names: list[str] = MISSING
 
