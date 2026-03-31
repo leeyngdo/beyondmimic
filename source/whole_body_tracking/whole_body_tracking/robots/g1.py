@@ -54,7 +54,7 @@ G1_CYLINDER_CFG = ArticulationCfg(
         joint_vel={".*": 0.0},
     ),
     soft_joint_pos_limit_factor=0.9,
-    actuators={d
+    actuators={
         "legs": ImplicitActuatorCfg(
             joint_names_expr=[
                 ".*_hip_yaw_joint",
