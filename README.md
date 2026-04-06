@@ -10,6 +10,7 @@
 [[Website]](https://beyondmimic.github.io/)
 [[Arxiv]](https://arxiv.org/abs/2508.08241)
 [[Video]](https://youtu.be/RS_MtKVIAzY)
+[[Checkpoints]](https://huggingface.co/KRAFTON/physical_ai_motion_tracking_experts)
 
 ## Overview
 
@@ -33,22 +34,16 @@ the [motion_tracking_controller](https://github.com/HybridRobotics/motion_tracki
   the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html). We recommend
   using the conda installation as it simplifies calling Python scripts from the terminal.
 
-- Clone this repository separately from the Isaac Lab installation (i.e., outside the `IsaacLab` directory):
+- Clone this repository with submodules:
 
 ```bash
-# Option 1: SSH
-git clone git@github.com:HybridRobotics/whole_body_tracking.git
-
-# Option 2: HTTPS
-git clone https://github.com/HybridRobotics/whole_body_tracking.git
+git clone --recurse-submodules git@github.com:HybridRobotics/whole_body_tracking.git
+cd whole_body_tracking
 ```
 
 - Pull the robot description files from GCS
 
 ```bash
-# Enter the repository
-cd whole_body_tracking
-# Rename all occurrences of whole_body_tracking (in files/directories) to your_fancy_extension_name
 curl -L -o unitree_description.tar.gz https://storage.googleapis.com/qiayuanl_robot_descriptions/unitree_description.tar.gz && \
 tar -xzf unitree_description.tar.gz -C source/whole_body_tracking/whole_body_tracking/assets/ && \
 rm unitree_description.tar.gz
@@ -60,50 +55,56 @@ rm unitree_description.tar.gz
 python -m pip install -e source/whole_body_tracking
 ```
 
+- Install TMR dependencies (for AMASS motion clustering)
+
+```bash
+pip install umap-learn hdbscan huggingface_hub
+cd third_party/TMR && bash prepare/download_pretrain_models.sh && cd ../..
+```
+
 ## Motion Tracking
 
 ### Motion Preprocessing & Registry Setup
 
-In order to manage the large set of motions we used in this work, we leverage the WandB registry to store and load
-reference motions automatically.
+We leverage the WandB registry to store and load reference motions automatically.
 Note: The reference motion should be retargeted and use generalized coordinates only.
 
-- Gather the reference motion datasets (please follow the original licenses), we use the same convention as .csv of
-  Unitree's dataset
+- Gather the reference motion datasets (please follow the original licenses):
 
     - Unitree-retargeted LAFAN1 Dataset is available
       on [HuggingFace](https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset)
+    - [AMASS](https://amass.is.tue.mpg.de/) retargeted to G1 (see [AMASS Clustering](#amass-motion-clustering) below)
     - Sidekicks are from [KungfuBot](https://kungfu-bot.github.io/)
-    - Christiano Ronaldo celebration is from [ASAP](https://github.com/LeCAR-Lab/ASAP).
+    - Christiano Ronaldo celebration is from [ASAP](https://github.com/LeCAR-Lab/ASAP)
     - Balance motions are from [HuB](https://hub-robot.github.io/)
-
 
 - Log in to your WandB account; access Registry under Core on the left. Create a new registry collection with the name "
   Motions" and artifact type "All Types".
 
-
 - Convert retargeted motions to include the maximum coordinates information (body pose, body velocity, and body
-  acceleration) via forward kinematics,
+  acceleration) via forward kinematics:
 
 ```bash
+# LAFAN1 (CSV format)
 python scripts/csv_to_npz.py --input_file {motion_name}.csv --input_fps 30 --output_name {motion_name} --headless
+
+# AMASS G1 (NPZ format)
+python scripts/npz_to_npz.py --input_file {motion_name}.npz --output_name {motion_name} --robot g1 --headless
 ```
 
-This will automatically upload the processed motion file to the WandB registry with output name {motion_name}.
-
-- Test if the WandB registry works properly by replaying the motion in Isaac Sim:
+- Batch preprocessing:
 
 ```bash
-python scripts/replay_npz.py --registry_name={your-organization}-org/wandb-registry-motions/{motion_name}
-```
+# Preprocess all LAFAN1 motions
+bash batch_preprocess.sh
 
-- Debugging
-    - Make sure to export WANDB_ENTITY to your organization name, not your personal username.
-    - If /tmp folder is not accessible, modify csv_to_npz.py L319 & L326 to a temporary folder of your choice.
+# Preprocess AMASS G1: npz_to_npz -> filter -> cluster
+bash batch_preprocess_amass.sh
+```
 
 ### Policy Training
 
-- Train policy by the following command:
+- Train a single-motion expert:
 
 ```bash
 python scripts/rsl_rl/train.py --task=Tracking-Flat-G1-v0 \
@@ -111,52 +112,131 @@ python scripts/rsl_rl/train.py --task=Tracking-Flat-G1-v0 \
 --headless --logger wandb --log_project_name {project_name} --run_name {run_name}
 ```
 
-### Policy Evaluation
+- Train all LAFAN1 per-motion experts (multi-GPU):
 
-- Play the trained policy by the following command:
+```bash
+bash batch_train.sh
+```
+
+- Train AMASS cluster experts (multi-GPU, see [AMASS Clustering](#amass-motion-clustering)):
+
+```bash
+bash batch_train_clusters.sh amass_g1/cluster_mapping
+```
+
+### Policy Evaluation
 
 ```bash
 python scripts/rsl_rl/play.py --task=Tracking-Flat-G1-v0 --num_envs=2 --wandb_path={wandb-run-path}
 ```
 
-The WandB run path can be located in the run overview. It follows the format {your_organization}/{project_name}/ along
-with a unique 8-character identifier. Note that run_name is different from run_path.
+### Pre-trained Checkpoints
+
+Pre-trained checkpoints are available on [HuggingFace](https://huggingface.co/KRAFTON/physical_ai_motion_tracking_experts):
+
+| Type | Robot | Dataset | Experts | Iterations |
+|------|-------|---------|---------|------------|
+| Per-motion | Unitree G1 | LAFAN1 | 40 | 30,000 |
+| Cluster | Unitree G1 | AMASS (filtered) | 16 | 100,000 |
+
+## AMASS Motion Clustering
+
+We provide a pipeline to cluster the large-scale [AMASS](https://amass.is.tue.mpg.de/) dataset into semantically meaningful groups using [TMR](https://github.com/Mathux/TMR) (Text-Motion Retrieval) embeddings. This enables training one multi-motion expert per cluster instead of thousands of individual experts.
+
+### Pipeline
+
+```
+Raw AMASS G1 (.npz)
+    |  npz_to_npz.py (Forward Kinematics via Isaac Sim)
+    v
+Processed motions (body_pos_w, joint_pos, ...)
+    |  filter_motions.py (reject infeasible frames: low height, extreme tilt)
+    v
+Filtered motions (18,424 clips from 17,596 files, 96.6% preserved)
+    |  cluster_amass_tmr.py (TMR encoding + FPS + UMAP + HDBSCAN)
+    v
+16 semantic clusters
+    |  merge_cluster_motions.py (concatenate all motions per cluster)
+    v
+Merged cluster NPZ files -> WandB registry -> batch_train_clusters.sh
+```
+
+### Clustering Method
+
+1. **TMR Encoding**: Each motion is converted to HumanML3D 263-dim features (G1 skeleton mapped to SMPL-22 joints), then encoded into 256-dim embeddings using a pretrained TMR motion encoder.
+
+2. **Density-Balanced Subsampling**: Farthest Point Sampling (FPS) selects 5,000 representative points from the embedding space. Dense regions (e.g., thousands of similar walking clips) are automatically thinned, while sparse regions (rare motions) are preserved.
+
+3. **Clustering**: UMAP dimensionality reduction + HDBSCAN on the subsampled points produces cluster labels. All remaining points are assigned to the nearest cluster centroid.
+
+### Resulting Clusters
+
+| Cluster | Name | Motions | Description |
+|---------|------|---------|-------------|
+| 0 | jumping_acrobatic | 383 | Jumping, scampering, acrobatic movements |
+| 1 | sitting_wiping | 645 | Sitting, wiping, upper-body tasks |
+| 2 | fast_curved_walking | 379 | Fast S-shape and curved walking |
+| 3 | running_sprinting | 358 | Running, sprinting, fast locomotion |
+| 4 | push_recovery | 425 | Balance recovery from pushes |
+| 5 | mixed_speed_walking | 790 | Variable-speed walking |
+| 6 | lifting_knocking | 343 | Lifting objects, knocking |
+| 7 | circular_walking | 300 | Circular and elliptical walking |
+| 8 | jogging | 639 | Jogging and light running |
+| 9 | diverse_actions | 1111 | Kicking, throwing, motorcycle, misc |
+| 10 | normal_walking | 776 | Normal-speed straight walking |
+| 11 | locomotion_general | 2322 | General locomotion and transitions |
+| 12 | object_manipulation | 2613 | Grasping, pouring, object interaction |
+| 13 | standing_gestures | 5759 | Standing poses, gestures, subtle movements |
+| 14 | upper_body_sports | 1128 | Handball, sports throwing |
+| 15 | throwing_dynamic | 453 | Dynamic throwing and fast upper-body |
+
+### Clustering Scripts
+
+```bash
+# Step 1: Encode and cluster filtered motions
+cd third_party/TMR  # TMR needs to be the working directory for model loading
+python ../../scripts/cluster_amass_tmr.py \
+    --amass_dir ../../amass_g1/filtered/g1 \
+    --density_subsample 5000 \
+    --output ../../amass_g1/clusters_filtered.npz
+
+# Step 2: Build mapping files
+python scripts/build_cluster_mapping.py \
+    --clusters amass_g1/clusters_filtered.npz \
+    --output_dir amass_g1/cluster_mapping
+
+# Step 3: Merge motions per cluster
+python scripts/merge_cluster_motions.py \
+    --cluster_summary amass_g1/cluster_mapping/cluster_summary.json \
+    --processed_dir amass_g1/processed/g1 \
+    --output_dir amass_g1/cluster_motions
+
+# Step 4: Upload to WandB and train
+bash batch_train_clusters.sh amass_g1/cluster_mapping
+```
 
 ## Code Structure
 
-Below is an overview of the code structure for this repository:
+- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp`** - MDP atomic functions (commands, rewards, observations, terminations, events)
+- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py`** - Environment hyperparameters
+- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py`** - PPO hyperparameters
+- **`source/whole_body_tracking/whole_body_tracking/robots`** - Robot-specific settings
+- **`scripts/`** - Preprocessing, training, evaluation, and clustering scripts
+- **`third_party/TMR`** - TMR submodule for semantic motion embeddings
 
-- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/mdp`**
-  This directory contains the atomic functions to define the MDP for BeyondMimic. Below is a breakdown of the functions:
+### Key Scripts
 
-    - **`commands.py`**
-      Command library to compute relevant variables from the reference motion, current robot state, and error
-      computations. This includes pose and velocity error calculation, initial state randomization, and adaptive
-      sampling.
-
-    - **`rewards.py`**
-      Implements the DeepMimic reward functions and smoothing terms.
-
-    - **`events.py`**
-      Implements domain randomization terms.
-
-    - **`observations.py`**
-      Implements observation terms for motion tracking and data collection.
-
-    - **`terminations.py`**
-      Implements early terminations and timeouts.
-
-- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py`**
-  Contains the environment (MDP) hyperparameters configuration for the tracking task.
-
-- **`source/whole_body_tracking/whole_body_tracking/tasks/tracking/config/g1/agents/rsl_rl_ppo_cfg.py`**
-  Contains the PPO hyperparameters for the tracking task.
-
-- **`source/whole_body_tracking/whole_body_tracking/robots`**
-  Contains robot-specific settings, including armature parameters, joint stiffness/damping calculation, and action scale
-  calculation.
-
-- **`scripts`**
-  Includes utility scripts for preprocessing motion data, training policies, and evaluating trained policies.
-
-This structure is designed to ensure modularity and ease of navigation for developers expanding the project.
+| Script | Description |
+|--------|-------------|
+| `scripts/csv_to_npz.py` | LAFAN1 CSV to enriched NPZ (FK via Isaac Sim) |
+| `scripts/npz_to_npz.py` | AMASS G1 NPZ to enriched NPZ (FK via Isaac Sim) |
+| `scripts/filter_motions.py` | Remove physically infeasible frames |
+| `scripts/cluster_amass_tmr.py` | TMR-based motion clustering |
+| `scripts/build_cluster_mapping.py` | Generate cluster mapping JSONs |
+| `scripts/merge_cluster_motions.py` | Merge cluster motions into single NPZ |
+| `scripts/rsl_rl/train.py` | Policy training |
+| `scripts/rsl_rl/play.py` | Policy evaluation |
+| `batch_train.sh` | Batch train LAFAN1 per-motion experts |
+| `batch_train_clusters.sh` | Batch train AMASS cluster experts |
+| `batch_preprocess_amass.sh` | End-to-end AMASS preprocessing pipeline |
+| `upload_checkpoints_to_hf.py` | Upload checkpoints to HuggingFace |

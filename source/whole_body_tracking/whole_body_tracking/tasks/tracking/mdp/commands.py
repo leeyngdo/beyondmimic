@@ -41,6 +41,36 @@ class MotionLoader:
         self._body_indexes = body_indexes
         self.time_step_total = self.joint_pos.shape[0]
 
+        # Multi-motion support: if merged NPZ with boundaries
+        if "motion_boundaries" in data:
+            self.multi_motion = True
+            self.motion_boundaries = torch.tensor(data["motion_boundaries"], dtype=torch.long, device=device)
+            self.motion_lengths = torch.tensor(data["motion_lengths"], dtype=torch.long, device=device)
+            self.num_motions = int(data["num_motions"][0])
+        else:
+            self.multi_motion = False
+            self.motion_boundaries = torch.tensor([0], dtype=torch.long, device=device)
+            self.motion_lengths = torch.tensor([self.time_step_total], dtype=torch.long, device=device)
+            self.num_motions = 1
+
+    def sample_motion_start(self, num_envs: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample random (motion_id, time_step) pairs for multi-motion training.
+
+        Returns:
+            motion_ids: (num_envs,) which motion each env tracks
+            time_steps: (num_envs,) starting frame index (global, into concatenated data)
+        """
+        motion_ids = torch.randint(0, self.num_motions, (num_envs,), device=device)
+        starts = self.motion_boundaries[motion_ids]
+        lengths = self.motion_lengths[motion_ids]
+        offsets = (torch.rand(num_envs, device=device) * lengths.float()).long()
+        time_steps = starts + offsets
+        return motion_ids, time_steps
+
+    def get_motion_end(self, motion_ids: torch.Tensor) -> torch.Tensor:
+        """Get the last valid frame index for each motion_id."""
+        return self.motion_boundaries[motion_ids] + self.motion_lengths[motion_ids]
+
     @property
     def body_pos_w(self) -> torch.Tensor:
         return self._body_pos_w[:, self._body_indexes]
@@ -73,6 +103,7 @@ class MotionCommand(CommandTerm):
 
         self.motion = MotionLoader(self.cfg.motion_file, self.body_indexes, device=self.device)
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
@@ -213,26 +244,35 @@ class MotionCommand(CommandTerm):
             fail_bins = current_bin_index[env_ids][episode_failed]
             self._current_bin_failed[:] = torch.bincount(fail_bins, minlength=self.bin_count)
 
-        # Sample
-        sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
-        sampling_probabilities = torch.nn.functional.pad(
-            sampling_probabilities.unsqueeze(0).unsqueeze(0),
-            (0, self.cfg.adaptive_kernel_size - 1),  # Non-causal kernel
-            mode="replicate",
-        )
-        sampling_probabilities = torch.nn.functional.conv1d(sampling_probabilities, self.kernel.view(1, 1, -1)).view(-1)
+        # Multi-motion: sample which motion each env tracks
+        if self.motion.multi_motion:
+            motion_ids, time_steps = self.motion.sample_motion_start(len(env_ids), self.device)
+            self.motion_ids[env_ids] = motion_ids
+            self.time_steps[env_ids] = time_steps
+        else:
+            # Single-motion: adaptive sampling within the motion
+            sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
+            sampling_probabilities = torch.nn.functional.pad(
+                sampling_probabilities.unsqueeze(0).unsqueeze(0),
+                (0, self.cfg.adaptive_kernel_size - 1),
+                mode="replicate",
+            )
+            sampling_probabilities = torch.nn.functional.conv1d(
+                sampling_probabilities, self.kernel.view(1, 1, -1)
+            ).view(-1)
 
-        sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
+            sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
+            sampled_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
 
-        sampled_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
-
-        self.time_steps[env_ids] = (
-            (sampled_bins + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device))
-            / self.bin_count
-            * (self.motion.time_step_total - 1)
-        ).long()
+            self.time_steps[env_ids] = (
+                (sampled_bins + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device))
+                / self.bin_count
+                * (self.motion.time_step_total - 1)
+            ).long()
 
         # Metrics
+        sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
+        sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
         H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
         H_norm = H / math.log(self.bin_count)
         pmax, imax = sampling_probabilities.max(dim=0)
@@ -278,7 +318,11 @@ class MotionCommand(CommandTerm):
 
     def _update_command(self):
         self.time_steps += 1
-        env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
+        if self.motion.multi_motion:
+            motion_ends = self.motion.get_motion_end(self.motion_ids)
+            env_ids = torch.where(self.time_steps >= motion_ends)[0]
+        else:
+            env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
         self._resample_command(env_ids)
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
