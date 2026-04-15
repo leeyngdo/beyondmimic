@@ -3,13 +3,16 @@
 #
 # Step 1: Run npz_to_npz.py on all amass_g1 npz files (multi-GPU parallel)
 # Step 2: Run filter_motions.py on processed output
-# Step 3: Run cluster_amass_tmr.py on filtered output
+# Step 3: Cluster filtered motions
 #
 # Usage:
-#   bash batch_preprocess_amass.sh          # Run all steps
-#   bash batch_preprocess_amass.sh --step 1 # Run only step 1 (preprocess)
-#   bash batch_preprocess_amass.sh --step 2 # Run only step 2 (filter)
-#   bash batch_preprocess_amass.sh --step 3 # Run only step 3 (cluster)
+#   bash batch_preprocess_amass.sh                        # Run all steps (default: kinematic cluster)
+#   bash batch_preprocess_amass.sh --step 1               # Run only step 1 (preprocess)
+#   bash batch_preprocess_amass.sh --step 2               # Run only step 2 (filter)
+#   bash batch_preprocess_amass.sh --step 3               # Run only step 3 (cluster)
+#   bash batch_preprocess_amass.sh --cluster tmr          # Use TMR clustering
+#   bash batch_preprocess_amass.sh --cluster kinematic    # Use kinematic clustering (default)
+#   bash batch_preprocess_amass.sh --step 3 --cluster tmr # Step 3 only with TMR
 
 set -e
 
@@ -21,10 +24,16 @@ JOBS_PER_GPU=2
 MAX_JOBS=$((${#GPUS[@]} * JOBS_PER_GPU))
 PYTHON="/home/jovyan/conda/beyondmimic-env/bin/python"
 
-STEP="${1:-all}"
-if [[ "$1" == "--step" ]]; then
-    STEP="$2"
-fi
+STEP="all"
+CLUSTER_METHOD="kinematic"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --step)     STEP="$2"; shift 2;;
+        --cluster)  CLUSTER_METHOD="$2"; shift 2;;
+        *)          STEP="$1"; shift;;
+    esac
+done
 
 # ============================================================
 # Step 1: npz_to_npz.py (FK via IsaacSim)
@@ -104,13 +113,9 @@ if [[ "$STEP" == "all" || "$STEP" == "2" ]]; then
 fi
 
 # ============================================================
-# Step 3: cluster_amass_tmr.py
+# Step 3: Clustering
 # ============================================================
 if [[ "$STEP" == "all" || "$STEP" == "3" ]]; then
-    echo "============================================================"
-    echo "Step 3: Clustering filtered motions (cluster_amass_tmr.py)"
-    echo "============================================================"
-
     FILTERED_DIR="$SCRIPT_DIR/amass_g1/filtered/g1"
 
     if [ ! -d "$FILTERED_DIR" ]; then
@@ -119,10 +124,42 @@ if [[ "$STEP" == "all" || "$STEP" == "3" ]]; then
         exit 1
     fi
 
-    $PYTHON scripts/cluster_amass_tmr.py \
-        --amass_dir "$FILTERED_DIR" \
-        --density_subsample 5000 \
-        --output "$SCRIPT_DIR/amass_g1/clusters.npz"
+    if [[ "$CLUSTER_METHOD" == "tmr" ]]; then
+        echo "============================================================"
+        echo "Step 3: Clustering filtered motions (TMR)"
+        echo "============================================================"
+
+        $PYTHON scripts/cluster_amass_tmr.py \
+            --amass_dir "$FILTERED_DIR" \
+            --density_subsample 5000 \
+            --output "$SCRIPT_DIR/amass_g1/clusters.npz"
+
+        echo ""
+        echo "Building cluster mapping..."
+        $PYTHON scripts/build_cluster_mapping.py \
+            --clusters "$SCRIPT_DIR/amass_g1/clusters.npz" \
+            --output_dir "$SCRIPT_DIR/amass_g1/cluster_mapping"
+
+    elif [[ "$CLUSTER_METHOD" == "kinematic" ]]; then
+        echo "============================================================"
+        echo "Step 3: Clustering processed motions (Kinematic K-Means)"
+        echo "============================================================"
+
+        $PYTHON scripts/cluster_amass_kinematic.py \
+            --amass_dir "$PROCESSED_DIR" \
+            --k 20 \
+            --output "$SCRIPT_DIR/amass_g1/clusters_kinematic.npz"
+
+        echo ""
+        echo "Building cluster mapping..."
+        $PYTHON scripts/build_cluster_mapping.py \
+            --clusters "$SCRIPT_DIR/amass_g1/clusters_kinematic.npz" \
+            --output_dir "$SCRIPT_DIR/amass_g1/cluster_mapping_kinematic"
+
+    else
+        echo "Unknown cluster method: $CLUSTER_METHOD (use 'tmr' or 'kinematic')"
+        exit 1
+    fi
 
     echo "Step 3 complete!"
     echo ""
