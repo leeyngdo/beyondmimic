@@ -5,14 +5,14 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class G1FlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 100000
+    max_iterations = 50000
     save_interval = 10000
     experiment_name = "g1_flat"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
-        actor_hidden_dims=[512, 256, 128],
-        critic_hidden_dims=[512, 256, 128],
+        actor_hidden_dims=[1024, 1024, 512],
+        critic_hidden_dims=[1024, 1024, 512],
         activation="elu",
     )
     algorithm = RslRlPpoAlgorithmCfg(
